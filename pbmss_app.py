@@ -38,7 +38,27 @@ from sympy import N
 from sklearn.metrics.pairwise import cosine_similarity, pairwise_distances
 from sklearn.manifold import MDS
 
-from crossref.restful import Works  # Import Crossref Works for citation lookup
+# Crossref API client: prefer crossref.restful.Works if available, else fallback to habanero
+try:
+    from crossref.restful import Works  # Import Crossref Works for citation lookup
+except Exception:
+    try:
+        from habanero import Crossref as _HCrossref  # type: ignore
+
+        class Works:  # minimal shim to match .doi() API used below
+            def __init__(self):
+                self._cr = _HCrossref()
+
+            def doi(self, doi_str):
+                try:
+                    resp = self._cr.works(ids=doi_str)
+                    # habanero returns a dict with 'message' key
+                    return resp.get("message", {}) if isinstance(resp, dict) else {}
+                except Exception:
+                    return {}
+
+    except Exception:
+        Works = None  # type: ignore
 import doi
 
 from sentence_transformers import SentenceTransformer
@@ -239,6 +259,9 @@ def check_update_status():
     return None
 
 def get_citation_count(doi_str):
+    if Works is None:
+        LOGGER.error("Crossref API client not available. Install 'crossref' or 'habanero'.")
+        return 0
     works = Works()
     try:
         paper_data = works.doi(doi_str)
@@ -344,6 +367,9 @@ def report_dates_from_metadata(metadata_file: str) -> dict:
 
 @st.cache_data(show_spinner=False)
 def get_references(doi_str):
+    if Works is None:
+        LOGGER.error("Crossref API client not available. Install 'crossref' or 'habanero'.")
+        return []
     works = Works()
     try:
         paper_data = works.doi(doi_str)

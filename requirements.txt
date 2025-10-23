@@ -17,6 +17,7 @@ pyyaml
 requests
 google-generativeai
 backoff
+habanero
 pyyaml
 torch
 dropbox
