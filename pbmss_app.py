@@ -244,15 +244,19 @@ MODEL_SERVER_URL = f"{MODEL_SERVER_BASE.rstrip('/')}/encode"
 def get_query_embedding(query, normalize=True, precision="ubinary"):
     payload = {"text": query, "normalize": normalize, "precision": precision}
     try:
-        response = requests.post(MODEL_SERVER_URL, json=payload)
+        # Short connect timeout, longer read timeout to allow for initial model load
+        response = requests.post(MODEL_SERVER_URL, json=payload, timeout=(3, 90))
         if response.status_code == 200:
             data = response.json()
             return data["embedding"]
         else:
             st.error(f"Model API returned error {response.status_code}: {response.text}")
             return None
-    except requests.exceptions.ConnectionError:
+    except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout):
         st.error("Model API not available. Please ensure that the model server is running.")
+        return None
+    except requests.exceptions.ReadTimeout:
+        st.warning("Model API timed out while generating an embedding. The model may still be loading — please retry in a moment.")
         return None
     except Exception as e:
         st.error(f"An error occurred while obtaining the query embedding: {e}")

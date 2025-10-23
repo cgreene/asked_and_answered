@@ -1,3 +1,5 @@
+import os
+import threading
 from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
@@ -40,6 +42,11 @@ def _load_model():
         pass
     model_ready = True
     print("Model loaded and moved to device:", device)
+
+# Optionally pre-load the model in a background thread so startup isn't blocked
+_PRELOAD = os.getenv("PRELOAD_MODEL", "false").lower() in {"1", "true", "yes"}
+if _PRELOAD:
+    threading.Thread(target=_load_model, daemon=True).start()
 
 # Define the endpoint to encode a query.
 @app.post("/encode")

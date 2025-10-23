@@ -8,6 +8,7 @@ services:
     image: mss-model:latest
     environment:
       - MSS_AUTHOR_SALT=${MSS_AUTHOR_SALT}
+      - PRELOAD_MODEL=true
     ports:
       - "8000:8000"
     volumes:
