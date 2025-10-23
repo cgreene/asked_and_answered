@@ -22,3 +22,7 @@ pyyaml
 torch
 dropbox
 u
+sympy
+faiss-cpu
+doi
+google-genai

@@ -59,14 +59,22 @@ except Exception:
 
     except Exception:
         Works = None  # type: ignore
-import doi
+# DOI cleaner is optional; if not present, we'll degrade gracefully
+try:
+    import doi as _doi  # type: ignore
+except Exception:
+    _doi = None
 
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.quantization import semantic_search_faiss
 
 from umap_pytorch import load_pumap
 
-import google.genai as genai
+# Google GenAI SDK (optional). We'll import lazily in the function.
+try:
+    import google.genai as genai  # type: ignore
+except Exception:
+    genai = None  # type: ignore
 
 # =============================================================================
 # Deterministic, salted author-order helpers (server-side only)
@@ -228,7 +236,10 @@ def get_donation_collected() -> int:
 # SECTION 3: API and Crossref Helpers
 # =============================================================================
 
-MODEL_SERVER_URL = "http://localhost:8000/encode"
+# Allow docker-compose to configure the model API location via env var.
+# Fallback to localhost for local dev outside Docker.
+MODEL_SERVER_BASE = os.getenv("MODEL_API_URL", "http://localhost:8000")
+MODEL_SERVER_URL = f"{MODEL_SERVER_BASE.rstrip('/')}/encode"
 
 def get_query_embedding(query, normalize=True, precision="ubinary"):
     payload = {"text": query, "normalize": normalize, "precision": precision}
@@ -274,8 +285,12 @@ def get_clean_doi(doi_str):
     if 'arxiv.org' in doi_str:
         return doi_str
     try:
-        doi_clean = doi.get_clean_doi(doi_str)
-        return doi_clean
+        if _doi is not None and hasattr(_doi, "get_clean_doi"):
+            return _doi.get_clean_doi(doi_str)  # type: ignore
+        # Fallback sanitizer: strip URL prefixes and whitespace
+        s = str(doi_str).strip()
+        s = re.sub(r"^https?://(dx\.)?doi\.org/", "", s, flags=re.IGNORECASE)
+        return s
     except Exception as e:
         LOGGER.error(f"Error cleaning DOI {doi_str}: {e}")
         return doi_str
@@ -1397,15 +1412,21 @@ Now, review the abstracts provided below and generate your summary.
 """
 
 def summarize_abstract(abstracts, instructions, api_key, model_name="gemini-2.0-flash-lite-preview-02-05"):
-    from google.genai import types
+    try:
+        from google.genai import types  # type: ignore
+    except Exception:
+        return "Google GenAI SDK not installed. Skipping AI summary."
     if not api_key:
         return "API key not provided. Please obtain your own API key at https://aistudio.google.com/apikey"
-    client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
+    try:
+        client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})  # type: ignore
+    except Exception as e:
+        return f"Google GenAI client unavailable: {e}"
     formatted_text = "\n".join(f"{idx + 1}. {abstract}" for idx, abstract in enumerate(abstracts))
     prompt = f"{instructions}\n\n{formatted_text}"
-    content_part = types.Part.from_text(text=prompt)
-    config = types.GenerateContentConfig(temperature=1, top_p=0.95, top_k=64, max_output_tokens=8192)
     try:
+        content_part = types.Part.from_text(text=prompt)
+        config = types.GenerateContentConfig(temperature=1, top_p=0.95, top_k=64, max_output_tokens=8192)
         response = client.models.generate_content(model=model_name, contents=content_part, config=config)
         summary = response.text
     except Exception as e:
