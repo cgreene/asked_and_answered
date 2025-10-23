@@ -16,6 +16,7 @@ crossref
 pyyaml
 requests
 google-generativeai
+backoff
 pyyaml
 torch
 dropbox
