@@ -24,5 +24,4 @@ dropbox
 u
 sympy
 faiss-cpu
-doi
 google-genai
