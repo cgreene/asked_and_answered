@@ -9,6 +9,8 @@ services:
     environment:
       - MSS_AUTHOR_SALT=${MSS_AUTHOR_SALT}
       - PRELOAD_MODEL=true
+      # Use a smaller model in development for faster startup. Remove or change for prod.
+      - MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
     ports:
       - "8000:8000"
     volumes:
@@ -30,6 +32,7 @@ services:
       - MSS_AUTHOR_SALT=${MSS_AUTHOR_SALT}
       # Point the app to the model API if needed (model_api binds 0.0.0.0:8000)
       - MODEL_API_URL=http://model_api:8000
+      - SESSIONS_DB_PATH=/data/sessions_history.db
     ports:
       - "8501:8501"
     volumes:

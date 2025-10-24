@@ -193,7 +193,15 @@ def log_time(task_name: str):
 # SECTION 2: Database and Session Helpers
 # =============================================================================
 
-def get_current_active_users(db_path: str = "sessions_history.db", timeout: int = 300) -> int:
+def get_current_active_users(db_path: str | None = None, timeout: int = 300) -> int:
+    # Use a writable path inside the container by default
+    if not db_path:
+        db_path = os.getenv("SESSIONS_DB_PATH", "/data/sessions_history.db")
+    # Ensure parent directory exists and is writable
+    try:
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    except Exception:
+        pass
     if 'session_id' not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
     session_id = st.session_state.session_id
