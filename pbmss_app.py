@@ -1,4 +1,6 @@
 import os
+import hashlib
+import hmac
 from pdb import pm
 import re
 import json
@@ -36,15 +38,126 @@ from sympy import N
 from sklearn.metrics.pairwise import cosine_similarity, pairwise_distances
 from sklearn.manifold import MDS
 
-from crossref.restful import Works  # Import Crossref Works for citation lookup
-import doi
+# Crossref API client: prefer crossref.restful.Works if available, else fallback to habanero
+try:
+    from crossref.restful import Works  # Import Crossref Works for citation lookup
+except Exception:
+    try:
+        from habanero import Crossref as _HCrossref  # type: ignore
+
+        class Works:  # minimal shim to match .doi() API used below
+            def __init__(self):
+                self._cr = _HCrossref()
+
+            def doi(self, doi_str):
+                try:
+                    resp = self._cr.works(ids=doi_str)
+                    # habanero returns a dict with 'message' key
+                    return resp.get("message", {}) if isinstance(resp, dict) else {}
+                except Exception:
+                    return {}
+
+    except Exception:
+        Works = None  # type: ignore
+# DOI cleaner is optional; if not present, we'll degrade gracefully
+try:
+    import doi as _doi  # type: ignore
+except Exception:
+    _doi = None
 
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.quantization import semantic_search_faiss
 
 from umap_pytorch import load_pumap
 
-import google.genai as genai
+# Google GenAI SDK (optional). We'll import lazily in the function.
+try:
+    import google.genai as genai  # type: ignore
+except Exception:
+    genai = None  # type: ignore
+
+# =============================================================================
+# Deterministic, salted author-order helpers (server-side only)
+# =============================================================================
+
+def _get_author_salt() -> str:
+    """
+    Retrieve the server-side salt used to deterministically order authors.
+    Priority:
+    1) Streamlit secrets (st.secrets["author_salt"])
+    2) Environment variable MSS_AUTHOR_SALT
+    3) Safe repo default "uberfordata" (DO NOT store real secrets in repo)
+    """
+    try:
+        # Streamlit secrets are server-side only; safe for production deployment.
+        if hasattr(st, "secrets") and isinstance(st.secrets, dict) and st.secrets.get("author_salt"):
+            return str(st.secrets.get("author_salt"))
+    except Exception:
+        pass
+    env_salt = os.getenv("MSS_AUTHOR_SALT")
+    if env_salt:
+        return env_salt
+    # Fallback demo value committed to the repo. Override in prod via secrets or env.
+    return "uberfordata"
+
+def _parse_authors(authors_str: str) -> list:
+    if not isinstance(authors_str, str) or not authors_str.strip():
+        return []
+    # Primary delimiter in our pipelines is semicolon. Fallback to comma if needed.
+    parts = [a.strip() for a in authors_str.split(";") if a.strip()]
+    if len(parts) <= 1:
+        parts = [a.strip() for a in authors_str.split(",") if a.strip()]
+    return parts
+
+def _format_authors(authors_list: list) -> str:
+    if not authors_list:
+        return ""
+    return "; ".join(authors_list)
+
+def _build_paper_seed(row: dict) -> str:
+    """
+    Build a per-paper deterministic seed from stable, non-author-controlled fields.
+    Preference order:
+      - PubMed: pmid + version
+      - arXiv: arXiv DOI/id
+      - Others: DOI
+      - Fallback: title|date
+    """
+    try:
+        source = str(row.get("source", "")).strip()
+        doi_val = row.get("doi")
+        pmid = row.get("pmid")
+        version = row.get("version")
+        title = row.get("title")
+        date = row.get("date")
+
+        if source == "PubMed" and pmid:
+            return f"pmid:{pmid}:{version if version is not None else ''}"
+        if source == "arXiv" or (isinstance(doi_val, str) and "arxiv.org" in doi_val):
+            return f"arxiv:{doi_val}"
+        if isinstance(doi_val, str) and doi_val:
+            return f"doi:{doi_val}"
+        return f"fallback:{title}|{date}"
+    except Exception:
+        return "fallback:unknown"
+
+def _author_sort_key(author: str, seed: str, salt: str) -> str:
+    """Return HMAC-SHA256(salt, f"{seed}|{author}") for deterministic per-paper ordering."""
+    msg = f"{seed}|{author}".encode("utf-8")
+    key = salt.encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+def reorder_authors_str(authors_str: str, row: dict, salt: str) -> str:
+    """
+    Deterministically reorder an authors string using a server-side salt.
+    """
+    authors = _parse_authors(authors_str)
+    if len(authors) <= 1:
+        return authors_str if isinstance(authors_str, str) else ""
+    # Include per-paper seed to avoid global bias, while remaining deterministic
+    seed = _build_paper_seed(row)
+    authors_sorted = sorted(authors, key=lambda a: (_author_sort_key(a, seed, salt), a.lower()))
+    return _format_authors(authors_sorted)
 
 # =============================================================================
 # SECTION 1: Logging and General Utilities
@@ -80,7 +193,15 @@ def log_time(task_name: str):
 # SECTION 2: Database and Session Helpers
 # =============================================================================
 
-def get_current_active_users(db_path: str = "sessions_history.db", timeout: int = 300) -> int:
+def get_current_active_users(db_path: str | None = None, timeout: int = 300) -> int:
+    # Use a writable path inside the container by default
+    if not db_path:
+        db_path = os.getenv("SESSIONS_DB_PATH", "/data/sessions_history.db")
+    # Ensure parent directory exists and is writable
+    try:
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    except Exception:
+        pass
     if 'session_id' not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
     session_id = st.session_state.session_id
@@ -123,20 +244,27 @@ def get_donation_collected() -> int:
 # SECTION 3: API and Crossref Helpers
 # =============================================================================
 
-MODEL_SERVER_URL = "http://localhost:8000/encode"
+# Allow docker-compose to configure the model API location via env var.
+# Fallback to localhost for local dev outside Docker.
+MODEL_SERVER_BASE = os.getenv("MODEL_API_URL", "http://localhost:8000")
+MODEL_SERVER_URL = f"{MODEL_SERVER_BASE.rstrip('/')}/encode"
 
 def get_query_embedding(query, normalize=True, precision="ubinary"):
     payload = {"text": query, "normalize": normalize, "precision": precision}
     try:
-        response = requests.post(MODEL_SERVER_URL, json=payload)
+        # Short connect timeout, longer read timeout to allow for initial model load
+        response = requests.post(MODEL_SERVER_URL, json=payload, timeout=(3, 90))
         if response.status_code == 200:
             data = response.json()
             return data["embedding"]
         else:
             st.error(f"Model API returned error {response.status_code}: {response.text}")
             return None
-    except requests.exceptions.ConnectionError:
+    except (requests.exceptions.ConnectionError, requests.exceptions.ConnectTimeout):
         st.error("Model API not available. Please ensure that the model server is running.")
+        return None
+    except requests.exceptions.ReadTimeout:
+        st.warning("Model API timed out while generating an embedding. The model may still be loading — please retry in a moment.")
         return None
     except Exception as e:
         st.error(f"An error occurred while obtaining the query embedding: {e}")
@@ -154,6 +282,9 @@ def check_update_status():
     return None
 
 def get_citation_count(doi_str):
+    if Works is None:
+        LOGGER.error("Crossref API client not available. Install 'crossref' or 'habanero'.")
+        return 0
     works = Works()
     try:
         paper_data = works.doi(doi_str)
@@ -166,8 +297,12 @@ def get_clean_doi(doi_str):
     if 'arxiv.org' in doi_str:
         return doi_str
     try:
-        doi_clean = doi.get_clean_doi(doi_str)
-        return doi_clean
+        if _doi is not None and hasattr(_doi, "get_clean_doi"):
+            return _doi.get_clean_doi(doi_str)  # type: ignore
+        # Fallback sanitizer: strip URL prefixes and whitespace
+        s = str(doi_str).strip()
+        s = re.sub(r"^https?://(dx\.)?doi\.org/", "", s, flags=re.IGNORECASE)
+        return s
     except Exception as e:
         LOGGER.error(f"Error cleaning DOI {doi_str}: {e}")
         return doi_str
@@ -259,6 +394,9 @@ def report_dates_from_metadata(metadata_file: str) -> dict:
 
 @st.cache_data(show_spinner=False)
 def get_references(doi_str):
+    if Works is None:
+        LOGGER.error("Crossref API client not available. Install 'crossref' or 'habanero'.")
+        return []
     works = Works()
     try:
         paper_data = works.doi(doi_str)
@@ -1168,6 +1306,16 @@ def combined_search(query: str, configs: list, top_show: int = 10, precision: st
     biorxiv_chunk_obj.close()
     medrxiv_chunk_obj.close()
     gc.collect()
+    # Apply deterministic, salted author ordering server-side before returning results
+    try:
+        author_salt = _get_author_salt()
+        if "authors" in final_results.columns:
+            # Apply row-wise to only the displayed results (fast)
+            final_results["authors"] = final_results.apply(
+                lambda r: reorder_authors_str(r.get("authors", ""), r.to_dict(), author_salt), axis=1
+            )
+    except Exception as e:
+        LOGGER.error(f"Author reordering failed: {e}")
     return final_results
 
 # =============================================================================
@@ -1276,15 +1424,21 @@ Now, review the abstracts provided below and generate your summary.
 """
 
 def summarize_abstract(abstracts, instructions, api_key, model_name="gemini-2.0-flash-lite-preview-02-05"):
-    from google.genai import types
+    try:
+        from google.genai import types  # type: ignore
+    except Exception:
+        return "Google GenAI SDK not installed. Skipping AI summary."
     if not api_key:
         return "API key not provided. Please obtain your own API key at https://aistudio.google.com/apikey"
-    client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
+    try:
+        client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})  # type: ignore
+    except Exception as e:
+        return f"Google GenAI client unavailable: {e}"
     formatted_text = "\n".join(f"{idx + 1}. {abstract}" for idx, abstract in enumerate(abstracts))
     prompt = f"{instructions}\n\n{formatted_text}"
-    content_part = types.Part.from_text(text=prompt)
-    config = types.GenerateContentConfig(temperature=1, top_p=0.95, top_k=64, max_output_tokens=8192)
     try:
+        content_part = types.Part.from_text(text=prompt)
+        config = types.GenerateContentConfig(temperature=1, top_p=0.95, top_k=64, max_output_tokens=8192)
         response = client.models.generate_content(model=model_name, contents=content_part, config=config)
         summary = response.text
     except Exception as e:

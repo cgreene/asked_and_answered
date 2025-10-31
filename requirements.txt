@@ -16,7 +16,12 @@ crossref
 pyyaml
 requests
 google-generativeai
+backoff
+habanero
 pyyaml
 torch
 dropbox
 u
+sympy
+faiss-cpu
+google-genai
